@@ -1,0 +1,1502 @@
+# java.io.IOException: Stale file handle 調査用コマンド
+# 対象: ECS Exec で入った Fargate コンテナ（UBI 9.8）の /mnt/logs
+# 日付の前提: 2026-10-14。RHEL 9.8 は 2026-05-19 GA、カーネル 5.14.0-687.5.1.el9_8。
+#
+# 貼り方
+# 1. ECS Exec のコマンドは /bin/bash にする。プロンプトが bash であることを確認する。
+# 2. このファイルの先頭から、単独行の ESTALE_PROBE_END までをまとめて貼る。
+# 3. 一括調査は読み取り専用。umount も rm も kill もしない。結果は標準出力に出る。
+# 4. 画面の最後にある SUMMARY と READ 行を、セッションの外へコピーして残す。
+# 5. ファイル全体を貼っても、一括調査のあとの個別ブロックは実行されない。
+#    個別ブロックは、必要な番号の set +H から ESTALE_BLOCK_番号 までを選んで貼る。
+# 6. 手元の PowerShell では実行しない。中身はコンテナの bash 用である。
+# 7. パスを変えるときだけ、貼る前に LOGROOT=/実際のパス を export する。既定は /mnt/logs。
+# 8. 行頭の # は説明であり、bash は実行しない。
+
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_PROBE_END'
+# Read-only probe for java.io.IOException: Stale file handle (errno 116, ESTALE)
+# on a UBI 9.8 container reached by ECS Exec. Default target is /mnt/logs.
+# This child shell does not unmount, delete, truncate, or signal the application.
+set -u
+set +e
+set +o pipefail
+export LC_ALL=C
+export LANG=C
+export LC_MESSAGES=C
+LOGROOT=${LOGROOT:-/mnt/logs}
+cd / >/dev/null 2>&1 || true
+shopt -s nullglob dotglob
+
+HINT_DIR_ESTALE=0
+HINT_SAW_ESTALE=0
+HINT_DELETED=0
+HINT_MISMATCH=0
+HINT_DOTNFS=0
+HINT_LCK=0
+HINT_NFS=0
+HINT_NOT_NFS=0
+HINT_PROXY=0
+HINT_SILLY=0
+HINT_TIMEOUT=0
+HINT_JAVA=0
+HINT_DSTATE=0
+EXCEPTION_HITS=0
+WALK_COUNT=0
+WALK_MAX=400
+KEY_LINES=""
+
+note() {
+  KEY_LINES="${KEY_LINES}
+$1"
+  printf '%s\n' "$1"
+}
+
+have() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+section() {
+  printf '\n======== %s ========\n' "$1"
+}
+
+mark_timeout() {
+  if [[ "$1" -eq 124 ]]; then
+    HINT_TIMEOUT=$((HINT_TIMEOUT + 1))
+    echo "NOTE: exit 124 means the time limit fired. A process blocked in NFS D state can ignore SIGKILL until the server answers. Open another ECS Exec session if this shell stops printing."
+  fi
+}
+
+mark_estale_text() {
+  case "$1" in
+    *"Stale file handle"*|*"stale file handle"*|*"Stale NFS file handle"*|*"古いファイルハンドルです"*|*"実効性のないNFSファイルハンドルです"*)
+      HINT_SAW_ESTALE=1
+      ;;
+  esac
+}
+
+run_cmd() {
+  local sec=$1
+  shift
+  local out rc
+  printf '+'
+  printf ' %q' "$@"
+  printf '\n'
+  if have timeout; then
+    out=$(timeout "$sec" "$@" 2>&1)
+    rc=$?
+  else
+    out=$("$@" 2>&1)
+    rc=$?
+  fi
+  printf '%s\n' "$out" | head -n 220
+  echo "exit=${rc}"
+  mark_timeout "$rc"
+  mark_estale_text "$out"
+  LAST_OUT=$out
+  LAST_RC=$rc
+}
+
+mask_word() {
+  local word=$1
+  local lower
+  lower=$(printf '%s' "$word" | tr '[:upper:]' '[:lower:]')
+  case "$lower" in
+    *password=*|*passwd=*|*secret=*|*token=*|*credential=*|*accesskey=*|*secretkey=*|*access_key=*|*session_token=*|*private_key=*)
+      printf '%s\n' "${word%%=*}=***MASKED***"
+      ;;
+    *)
+      printf '%s\n' "$word"
+      ;;
+  esac
+}
+
+mask_line() {
+  local line=$1
+  local word out=""
+  set -f
+  for word in $line; do
+    out="${out} $(mask_word "$word")"
+  done
+  set +f
+  printf '%s\n' "${out# }"
+}
+
+value_allowed() {
+  case "$1" in
+    PATH|HOME|USER|LOGNAME|LANG|LC_ALL|LC_MESSAGES|TZ|PWD|OLDPWD|HOSTNAME|JAVA_HOME|JAVA_OPTS|JDK_JAVA_OPTIONS|JAVA_TOOL_OPTIONS|AWS_EXECUTION_ENV|AWS_REGION|AWS_DEFAULT_REGION|AWS_DEFAULT_OUTPUT|ECS_CONTAINER_METADATA_URI_V4|ECS_AGENT_URI)
+      return 0
+      ;;
+  esac
+  case "$1" in
+    *PASSWORD*|*SECRET*|*TOKEN*|*CREDENTIAL*|*ACCESS_KEY*|*SESSION*)
+      return 1
+      ;;
+  esac
+  case "$1" in
+    *LOG*|*DIR|*PATH|*HOME)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+decode_ipv4() {
+  local spec=$1
+  local hex=${spec%:*}
+  local port=${spec#*:}
+  local b1=${hex:6:2}
+  local b2=${hex:4:2}
+  local b3=${hex:2:2}
+  local b4=${hex:0:2}
+  printf '%d.%d.%d.%d:%d\n' "0x${b1}" "0x${b2}" "0x${b3}" "0x${b4}" "0x${port}"
+}
+
+state_name() {
+  case "$1" in
+    01) printf '%s\n' ESTABLISHED ;;
+    02) printf '%s\n' SYN_SENT ;;
+    03) printf '%s\n' SYN_RECV ;;
+    04) printf '%s\n' FIN_WAIT1 ;;
+    05) printf '%s\n' FIN_WAIT2 ;;
+    06) printf '%s\n' TIME_WAIT ;;
+    07) printf '%s\n' CLOSE ;;
+    08) printf '%s\n' CLOSE_WAIT ;;
+    09) printf '%s\n' LAST_ACK ;;
+    0A|0a) printf '%s\n' LISTEN ;;
+    0B|0b) printf '%s\n' CLOSING ;;
+    0C|0c) printf '%s\n' NEW_SYN_RECV ;;
+    *) printf '%s\n' "UNKNOWN_${1}" ;;
+  esac
+}
+
+decode_flags() {
+  local oct=$1
+  local n=$((8#$oct))
+  local acc=$((n & 3))
+  local out=""
+  if [[ $acc -eq 0 ]]; then out="O_RDONLY"; fi
+  if [[ $acc -eq 1 ]]; then out="O_WRONLY"; fi
+  if [[ $acc -eq 2 ]]; then out="O_RDWR"; fi
+  local bit name masked
+  local bits=(64 128 512 1024 2048 4096 16384 32768 65536 131072 262144 524288 1048576 2097152)
+  local names=(O_CREAT O_EXCL O_TRUNC O_APPEND O_NONBLOCK O_DSYNC O_DIRECT O_LARGEFILE O_DIRECTORY O_NOFOLLOW O_NOATIME O_CLOEXEC O_SYNC_BIT O_PATH)
+  local i=0
+  local count=${#bits[@]}
+  while [[ $i -lt $count ]]; do
+    bit=${bits[$i]}
+    name=${names[$i]}
+    masked=$((n & bit))
+    if [[ $masked -eq $bit ]]; then
+      out="${out} ${name}"
+    fi
+    i=$((i + 1))
+  done
+  printf '%s\n' "$out"
+}
+
+EVENT_NAMES=(
+  inoderevalidate dentryrevalidate datainvalidate attrinvalidate
+  vfsopen vfslookup vfsaccess vfsupdatepage
+  vfsreadpage vfsreadpages vfswritepage vfswritepages
+  vfsgetdents vfssetattr vfsflush vfsfsync vfslock vfsrelease
+  congestionwait setattrtrunc extendwrite sillyrename
+  shortread shortwrite delay pnfs_read pnfs_write
+)
+BYTE_NAMES=(
+  normalreadbytes normalwrittenbytes directreadbytes directwrittenbytes
+  serverreadbytes serverwrittenbytes readpages writepages
+)
+
+label_numbers() {
+  local kind=$1
+  shift
+  local -a names=("$@")
+  local n=${#LAST_NUMS[@]}
+  local i name
+  echo "${kind}_count=${n} known_names=${#names[@]}"
+  i=0
+  while [[ $i -lt $n ]]; do
+    if [[ $i -lt ${#names[@]} ]]; then
+      name=${names[$i]}
+    else
+      name="extra_$((i + 1))"
+    fi
+    printf '  %s=%s\n' "$name" "${LAST_NUMS[$i]}"
+    if [[ "$name" == "sillyrename" ]]; then
+      if [[ "${LAST_NUMS[$i]}" == "0" ]]; then
+        :
+      else
+        HINT_SILLY=1
+        note "HINT sillyrename_counter=${LAST_NUMS[$i]}"
+      fi
+    fi
+    i=$((i + 1))
+  done
+}
+
+split_nums() {
+  LAST_NUMS=()
+  local rest=$1
+  read -r -a LAST_NUMS <<< "$rest"
+}
+
+label_op() {
+  local trim=$1
+  local name=${trim%%:*}
+  local rest=${trim#*:}
+  split_nums "$rest"
+  local n=${#LAST_NUMS[@]}
+  if [[ $n -lt 3 ]]; then
+    echo "OP_RAW ${trim}"
+    return
+  fi
+  local ops=${LAST_NUMS[0]}
+  local trans=${LAST_NUMS[1]}
+  local timeouts=${LAST_NUMS[2]}
+  local retrans=$((trans - ops))
+  local errors="absent"
+  if [[ $n -ge 9 ]]; then
+    errors=${LAST_NUMS[8]}
+  fi
+  if [[ "$ops" == "0" ]]; then
+    return
+  fi
+  echo "OP ${name} ops=${ops} trans=${trans} retrans=${retrans} timeouts=${timeouts} errors=${errors} fields=${n}"
+  case "$name" in
+    READ|WRITE|COMMIT|OPEN|CLOSE|CREATE|REMOVE|RENAME|LINK|SETATTR|GETATTR|ACCESS|LOOKUP)
+      echo "OP_DETAIL ${name} raw=${rest}"
+      ;;
+  esac
+}
+
+selftest() {
+  local fail=0
+  local got
+  got=$(decode_ipv4 "0100007F:0801")
+  if [[ "$got" == "127.0.0.1:2049" ]]; then
+    echo "SELFTEST ipv4 ok"
+  else
+    echo "SELFTEST ipv4 FAIL got=${got}"
+    fail=1
+  fi
+  got=$(decode_flags "02100002")
+  if [[ "$got" == *O_RDWR* && "$got" == *O_LARGEFILE* && "$got" == *O_CLOEXEC* ]]; then
+    if [[ "$got" == *O_APPEND* ]]; then
+      echo "SELFTEST flags FAIL append unexpectedly in ${got}"
+      fail=1
+    else
+      echo "SELFTEST flags ok ${got}"
+    fi
+  else
+    echo "SELFTEST flags FAIL got=${got}"
+    fail=1
+  fi
+  if [[ "${EVENT_NAMES[21]}" == "sillyrename" ]]; then
+    echo "SELFTEST events ok"
+  else
+    echo "SELFTEST events FAIL ${EVENT_NAMES[21]}"
+    fail=1
+  fi
+  got=$(state_name "01")
+  if [[ "$got" == "ESTABLISHED" ]]; then
+    echo "SELFTEST state ok"
+  else
+    echo "SELFTEST state FAIL"
+    fail=1
+  fi
+  return "$fail"
+}
+
+if [[ "${ESTALE_SELFTEST:-0}" == "1" ]]; then
+  selftest
+  exit $?
+fi
+
+section "0 safety and identity"
+echo "This probe only reads. It does not unmount, delete, truncate, rotate, or signal processes."
+echo "LOGROOT=${LOGROOT}"
+echo "bash=${BASH_VERSION}"
+echo "date_local=$(date +%Y-%m-%dT%H:%M:%S%z 2>/dev/null)"
+echo "date_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+echo "hostname=$(uname -n 2>/dev/null)"
+id
+uname -a
+note "KEY bash=${BASH_VERSION}"
+
+section "1 original locale before this shell forces C"
+echo "The Java process keeps the container locale. This shell now uses C so stat and ls stay English."
+echo "PARENT_LOCALE_WAS_ALREADY_REPLACED_IN_THIS_CHILD=1"
+if [[ -r /proc/1/environ ]]; then
+  pid1_lang=""
+  pid1_lcall=""
+  while IFS= read -r -d '' ev; do
+    case "$ev" in
+      LANG=*) pid1_lang=${ev#LANG=} ;;
+      LC_ALL=*) pid1_lcall=${ev#LC_ALL=} ;;
+    esac
+  done < /proc/1/environ
+  echo "pid1_LANG=${pid1_lang}"
+  echo "pid1_LC_ALL=${pid1_lcall}"
+else
+  echo "pid1 environ is not readable. The locale of Java may still be inside /proc/PID/environ below."
+fi
+
+section "2 os release"
+if [[ -r /etc/os-release ]]; then
+  cat /etc/os-release
+else
+  echo "NO /etc/os-release"
+fi
+if [[ -r /etc/redhat-release ]]; then
+  cat /etc/redhat-release
+fi
+
+section "3 tool presence"
+for c in bash ls stat df find findmnt ps awk grep sed timeout readlink ss lsof nfsstat jcmd java rpm tr sort head tail wc date id uname cat; do
+  if have "$c"; then
+    printf 'HAVE %s -> %s\n' "$c" "$(command -v "$c")"
+  else
+    printf 'MISSING %s\n' "$c"
+  fi
+done
+echo "NOTE: RHEL 9.8 and UBI 9.8 ship util-linux 2.37.x. lsfd arrived in util-linux 2.38, so lsfd is absent here. lsof and nfsstat are often absent in a container image. /proc replaces them."
+
+section "4 refuse a dangerous root"
+case "$LOGROOT" in
+  /|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*)
+    echo "REFUSING LOGROOT=${LOGROOT}"
+    exit 1
+    ;;
+esac
+if [[ -e "$LOGROOT" ]]; then
+  echo "PATH_PRESENT ${LOGROOT}"
+else
+  echo "PATH_MISSING ${LOGROOT}"
+  note "KEY path_missing=1"
+fi
+
+section "5 mounts covering LOGROOT"
+if [[ -r /proc/self/mountinfo ]]; then
+  echo "-- raw mountinfo lines that mention the path --"
+  while IFS= read -r line; do
+    case "$line" in
+      *" ${LOGROOT} "*|*" ${LOGROOT}"*) printf '%s\n' "$line" ;;
+    esac
+  done < /proc/self/mountinfo
+else
+  echo "NO /proc/self/mountinfo"
+fi
+
+best_len=0
+best_src=""
+best_mnt=""
+best_type=""
+best_opts=""
+if [[ -r /proc/mounts ]]; then
+  echo "-- /proc/mounts longest prefix --"
+  while read -r src mnt fstype opts _freq _pass; do
+    match=0
+    if [[ "$mnt" == "/" ]]; then
+      match=1
+    fi
+    if [[ "$LOGROOT" == "$mnt" ]]; then
+      match=1
+    fi
+    if [[ "$LOGROOT" == "$mnt"/* ]]; then
+      match=1
+    fi
+    if [[ $match -eq 1 ]]; then
+      mlen=${#mnt}
+      if [[ $mlen -gt $best_len ]]; then
+        best_len=$mlen
+        best_src=$src
+        best_mnt=$mnt
+        best_type=$fstype
+        best_opts=$opts
+      fi
+    fi
+  done < /proc/mounts
+  echo "BEST_MOUNT mnt=${best_mnt} type=${best_type} src=${best_src}"
+  echo "BEST_OPTS ${best_opts}"
+  note "KEY mount_type=${best_type}"
+  note "KEY mount_src=${best_src}"
+  note "KEY mount_point=${best_mnt}"
+  case "$best_type" in
+    nfs|nfs4)
+      HINT_NFS=1
+      ;;
+    "")
+      ;;
+    *)
+      HINT_NOT_NFS=1
+      ;;
+  esac
+  case "$best_src $best_opts" in
+    *127.0.0.1*)
+      HINT_PROXY=1
+      note "KEY localhost_nfs_proxy=1"
+      ;;
+  esac
+  case ",${best_opts}," in
+    *,hard,*) echo "OPT hard: a lost server blocks instead of returning an error to Java" ;;
+  esac
+  case ",${best_opts}," in
+    *,soft,*|*,softerr,*) echo "OPT soft_or_softerr: a major timeout can return an error to Java" ;;
+  esac
+  case "$best_opts" in
+    *timeo=*)
+      to=${best_opts#*timeo=}
+      to=${to%%,*}
+      case "$to" in
+        [0-9]*)
+          echo "OPT timeo=${to} deciseconds, about $((to / 10)) seconds plus a fraction, before one retry. The nfs manual defines timeo in tenths of a second."
+          ;;
+        *)
+          echo "OPT timeo=${to}"
+          ;;
+      esac
+      ;;
+  esac
+  case "$best_opts" in
+    *retrans=*)
+      rt=${best_opts#*retrans=}
+      rt=${rt%%,*}
+      echo "OPT retrans=${rt}. For TCP the usual default is 2. This counts major retries. It does not describe ESTALE."
+      ;;
+  esac
+  case "$best_opts" in
+    *vers=*|*nfsvers=*)
+      echo "OPT version field is inside the options above. EFS speaks NFSv4.0 or NFSv4.1. Fargate volumes are normally vers=4.1."
+      ;;
+  esac
+else
+  echo "NO /proc/mounts"
+fi
+
+if have findmnt; then
+  section "5b findmnt"
+  run_cmd 15 findmnt -T "$LOGROOT" -o TARGET,SOURCE,FSTYPE,OPTIONS
+fi
+
+section "6 filesystem and space"
+if [[ -e "$LOGROOT" ]]; then
+  run_cmd 15 stat -f -c 'fstype_hex=%t fstype_name=%T blocks=%b block_size=%S free_blocks=%f avail_blocks=%a inodes=%c' -- "$LOGROOT"
+  run_cmd 15 df -hT -- "$LOGROOT"
+  run_cmd 15 df -i -- "$LOGROOT"
+  run_cmd 15 stat -c 'dir inode=%i device=%d links=%h mode=%A mtime=%y name=%n' -- "$LOGROOT"
+  run_cmd 15 ls -ld --time-style=full-iso --color=never -- "$LOGROOT"
+fi
+
+section "7 directory listing"
+if [[ -d "$LOGROOT" ]]; then
+  run_cmd 20 ls -la --time-style=full-iso --color=never -- "$LOGROOT"
+fi
+
+section "8 bounded walk"
+ROOT_DEV=""
+if [[ -e "$LOGROOT" ]]; then
+  ROOT_DEV=$(stat -c '%d' -- "$LOGROOT" 2>/dev/null)
+  echo "root_device=${ROOT_DEV}"
+fi
+
+declare -a LOG_CANDIDATES=()
+walk() {
+  local dir=$1
+  local depth=$2
+  local path base line mtime size ino ftype dev age now
+  if [[ $depth -gt 4 ]]; then
+    return
+  fi
+  for path in "$dir"/*; do
+    if [[ $WALK_COUNT -ge $WALK_MAX ]]; then
+      echo "WALK_TRUNCATED max=${WALK_MAX}"
+      return
+    fi
+    WALK_COUNT=$((WALK_COUNT + 1))
+    if [[ -L "$path" ]]; then
+      echo "SYMLINK ${path} -> $(readlink -- "$path" 2>/dev/null)"
+      continue
+    fi
+    line=$(stat -c '%F|%i|%s|%Y|%d|%n' -- "$path" 2>&1)
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+      echo "STAT_FAIL ${path} :: ${line}"
+      mark_estale_text "$line"
+      case "$line" in
+        *"Stale file handle"*) HINT_DIR_ESTALE=1 ;;
+      esac
+      continue
+    fi
+    ftype=${line%%|*}
+    rest=${line#*|}
+    ino=${rest%%|*}
+    rest=${rest#*|}
+    size=${rest%%|*}
+    rest=${rest#*|}
+    mtime=${rest%%|*}
+    rest=${rest#*|}
+    dev=${rest%%|*}
+    printf 'ENTRY type=%s inode=%s size=%s mtime=%s dev=%s path=%s\n' "$ftype" "$ino" "$size" "$mtime" "$dev" "$path"
+    base=${path##*/}
+    case "$base" in
+      .nfs*)
+        HINT_DOTNFS=$((HINT_DOTNFS + 1))
+        echo "DOTNFS ${path}"
+        ;;
+      *.lck)
+        HINT_LCK=$((HINT_LCK + 1))
+        echo "LOCKFILE ${path}"
+        ;;
+    esac
+    if [[ "$size" == "0" ]]; then
+      echo "ZERO_BYTE ${path}"
+    fi
+    case "$base" in
+      *.log|*.out|*.err|*.txt|*.log.*|*.out.*)
+        case "$base" in
+          *.gz|*.zip|*.xz) ;;
+          *) LOG_CANDIDATES+=("${mtime}|${path}") ;;
+        esac
+        ;;
+    esac
+    case "$ftype" in
+      directory*)
+        if [[ -n "$ROOT_DEV" ]]; then
+          if [[ "$dev" == "$ROOT_DEV" ]]; then
+            walk "$path" $((depth + 1))
+          else
+            echo "SKIP_OTHER_DEVICE ${path}"
+          fi
+        else
+          walk "$path" $((depth + 1))
+        fi
+        ;;
+    esac
+  done
+}
+
+if [[ -d "$LOGROOT" ]]; then
+  now=$(date +%s)
+  walk "$LOGROOT" 1
+  echo "walk_entries=${WALK_COUNT} dotnfs=${HINT_DOTNFS} lck=${HINT_LCK}"
+  note "KEY walk_entries=${WALK_COUNT} dotnfs=${HINT_DOTNFS} lck=${HINT_LCK}"
+  echo "ZERO_BYTE lines above are empty files inside the walk. A new empty file beside a large deleted descriptor is a common rotation signature."
+fi
+
+section "9 tails of newest log-like files"
+if [[ ${#LOG_CANDIDATES[@]} -eq 0 ]]; then
+  echo "NO_LOG_CANDIDATES in the bounded walk. Files may use another suffix, or the directory was unreadable."
+else
+  mapfile -t SORTED_LOGS < <(printf '%s\n' "${LOG_CANDIDATES[@]}" | sort -t '|' -k1,1nr | head -n 25)
+  for row in "${SORTED_LOGS[@]}"; do
+    path=${row#*|}
+    echo "-- tail ${path} --"
+    if have timeout; then
+      out=$(timeout 15 tail -n 80 -- "$path" 2>&1)
+      rc=$?
+    else
+      out=$(tail -n 80 -- "$path" 2>&1)
+      rc=$?
+    fi
+    if [[ $rc -ne 0 ]]; then
+      printf '%s\n' "$out"
+      echo "exit=${rc}"
+      mark_timeout "$rc"
+      mark_estale_text "$out"
+      continue
+    fi
+    hits=0
+    while IFS= read -r line; do
+      low=$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')
+      show=0
+      case "$low" in
+        *"stale file handle"*|*"stale nfs file handle"*|*"estale"*) show=1 ;;
+      esac
+      case "$line" in
+        *"古いファイルハンドルです"*|*"実効性のないNFSファイルハンドルです"*|*"java.util.logging.ErrorManager: 1"*|*"FileSystemException"*) show=1 ;;
+      esac
+      if [[ $show -eq 1 ]]; then
+        printf '%s\n' "$line"
+        hits=$((hits + 1))
+        EXCEPTION_HITS=$((EXCEPTION_HITS + 1))
+        HINT_SAW_ESTALE=1
+        if [[ $hits -ge 15 ]]; then
+          echo "HIT_CAP 15"
+          break
+        fi
+      fi
+    done <<< "$out"
+    echo "matches_in_tail=${hits}"
+  done
+fi
+note "KEY exception_line_hits=${EXCEPTION_HITS}"
+
+section "10 processes and file descriptors"
+if [[ -d /proc/1 ]]; then
+  proc_ready=1
+else
+  proc_ready=0
+fi
+if [[ $proc_ready -eq 0 ]]; then
+  echo "NO_LINUX_PROC. Run this inside the Fargate container. A workstation shell has no container /proc."
+else
+  echo "-- process table from /proc (comm, state, exe) --"
+  for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    comm=$(cat "$d/comm" 2>/dev/null)
+    state=""
+    if [[ -r "$d/status" ]]; then
+      while IFS= read -r sline; do
+        case "$sline" in
+          State:*)
+            state=${sline#State:}
+            while [[ "$state" == [[:space:]]* ]]; do
+              state=${state#?}
+            done
+            ;;
+        esac
+      done < "$d/status"
+    fi
+    exe=$(readlink "$d/exe" 2>/dev/null)
+    printf 'PID %s comm=%s state=%s exe=%s\n' "$pid" "$comm" "$state" "$exe"
+    case "$state" in
+      D*|D\ *) HINT_DSTATE=$((HINT_DSTATE + 1)) ;;
+    esac
+  done
+
+  for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    [[ -r "$d/cmdline" ]] || continue
+    comm=$(cat "$d/comm" 2>/dev/null)
+    exe=$(readlink "$d/exe" 2>/dev/null)
+    cmdline=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+    is_java=0
+    case "$comm" in
+      java|jsvc) is_java=1 ;;
+    esac
+    case "$exe" in
+      */java|*/jsvc) is_java=1 ;;
+    esac
+    case "$cmdline" in
+      *java\ *|java\ *) is_java=1 ;;
+    esac
+    if [[ -r "$d/maps" ]]; then
+      while IFS= read -r mline; do
+        case "$mline" in
+          *libjvm*) is_java=1; break ;;
+        esac
+      done < "$d/maps"
+    fi
+    interesting=$is_java
+    # A non-Java process that holds /mnt/logs is equally important (shipper, rotator, shell).
+    holds=0
+    if [[ -d "$d/fd" ]]; then
+      for fdpath in "$d"/fd/*; do
+        target=$(readlink "$fdpath" 2>/dev/null)
+        case "$target" in
+          "${LOGROOT}"|"${LOGROOT}"/*|*" (deleted)")
+            case "$target" in
+              "${LOGROOT}"|"${LOGROOT}"/*|*"${LOGROOT}"*) holds=1 ;;
+            esac
+            ;;
+        esac
+      done
+    fi
+    if [[ $is_java -eq 0 && $holds -eq 0 ]]; then
+      continue
+    fi
+    if [[ $is_java -eq 1 ]]; then
+      HINT_JAVA=$((HINT_JAVA + 1))
+    fi
+    section "10 pid ${pid} comm=${comm} java=${is_java} holds_log_or_deleted=${holds}"
+    echo "exe=${exe}"
+    echo "cmdline_masked=$(mask_line "$cmdline")"
+    echo "-- status --"
+    while IFS= read -r line; do
+      case "$line" in
+        State:*|Uid:*|Gid:*|NStgid:*|Threads:*|Pid:*) printf '%s\n' "$line" ;;
+      esac
+    done < "$d/status"
+    echo "-- limits --"
+    if [[ -r "$d/limits" ]]; then
+      while IFS= read -r line; do
+        case "$line" in
+          "Max open files"*|"Max file locks"*) printf '%s\n' "$line" ;;
+        esac
+      done < "$d/limits"
+    fi
+    fds=("$d"/fd/*)
+    echo "fd_count=${#fds[@]}"
+    echo "-- environ keys (values only for an allow list, secrets masked) --"
+    if [[ -r "$d/environ" ]]; then
+      while IFS= read -r -d '' ev; do
+        key=${ev%%=*}
+        val=${ev#*=}
+        if value_allowed "$key"; then
+          printf '%s=%s\n' "$key" "$(mask_line "$val")"
+        else
+          printf '%s=SET\n' "$key"
+        fi
+      done < "$d/environ"
+    else
+      echo "environ not readable"
+    fi
+    echo "-- fds pointing at LOGROOT or deleted --"
+    for fdpath in "$d"/fd/*; do
+      base=${fdpath##*/}
+      target=$(readlink "$fdpath" 2>&1)
+      rc=$?
+      if [[ $rc -ne 0 ]]; then
+        echo "READLINK_FAIL fd=${base} :: ${target}"
+        continue
+      fi
+      related=0
+      deleted=0
+      case "$target" in
+        *" (deleted)") deleted=1 ;;
+      esac
+      case "$target" in
+        "${LOGROOT}"|"${LOGROOT}"/*) related=1 ;;
+        *" (deleted)")
+          bare=${target% (deleted)}
+          case "$bare" in
+            "${LOGROOT}"|"${LOGROOT}"/*) related=1 ;;
+          esac
+          ;;
+      esac
+      if [[ $related -eq 0 ]]; then
+        continue
+      fi
+      echo "FD ${base} -> ${target}"
+      fdstat=$(stat -c 'ftype=%F inode=%i device=%d size=%s links=%h' -- "$fdpath" 2>&1)
+      echo "FD_STAT ${fdstat}"
+      mark_estale_text "$fdstat"
+      bare=$target
+      if [[ $deleted -eq 1 ]]; then
+        bare=${target% (deleted)}
+        HINT_DELETED=$((HINT_DELETED + 1))
+        echo "DELETED_MARKER ${bare}"
+      fi
+      pathstat=$(stat -c 'ftype=%F inode=%i device=%d size=%s links=%h' -- "$bare" 2>&1)
+      echo "PATH_STAT ${pathstat}"
+      mark_estale_text "$pathstat"
+      fd_ino=""
+      path_ino=""
+      case "$fdstat" in
+        *"inode="*)
+          tmp=${fdstat#*inode=}
+          fd_ino=${tmp%% *}
+          ;;
+      esac
+      case "$pathstat" in
+        *"inode="*)
+          tmp=${pathstat#*inode=}
+          path_ino=${tmp%% *}
+          ;;
+      esac
+      if [[ -n "$fd_ino" && -n "$path_ino" ]]; then
+        if [[ "$fd_ino" == "$path_ino" ]]; then
+          echo "INODE_MATCH ${fd_ino}"
+        else
+          echo "INODE_MISMATCH fd=${fd_ino} path=${path_ino} file=${bare}"
+          HINT_MISMATCH=$((HINT_MISMATCH + 1))
+        fi
+      fi
+      if [[ -r "$d/fdinfo/$base" ]]; then
+        echo "-- fdinfo ${base} --"
+        flags_oct=""
+        while IFS= read -r fline; do
+          printf '%s\n' "$fline"
+          case "$fline" in
+            flags:*)
+              flags_oct=${fline#flags:}
+              flags_oct=${flags_oct//[[:space:]]/}
+              ;;
+          esac
+        done < "$d/fdinfo/$base"
+        case "$flags_oct" in
+          [0-7]*)
+            echo "FLAGS_DECODE $(decode_flags "$flags_oct")"
+            ;;
+          "")
+            ;;
+          *)
+            echo "FLAGS_UNPARSED ${flags_oct}"
+            ;;
+        esac
+      fi
+      case "$fdstat" in
+        *"regular file"*|*"regular empty file"*)
+          if [[ ${TAILED:-0} -lt 3 ]]; then
+            echo "-- read-only tail of this regular-file fd --"
+            if have timeout; then
+              tout=$(timeout 10 tail -n 12 -- "$fdpath" 2>&1 | tr -d '\000' | head -c 1200)
+            else
+              tout=$(tail -n 12 -- "$fdpath" 2>&1 | tr -d '\000' | head -c 1200)
+            fi
+            printf '%s\n' "$tout"
+            echo
+            mark_estale_text "$tout"
+            TAILED=$((${TAILED:-0} + 1))
+          fi
+          ;;
+      esac
+    done
+    TAILED=0
+  done
+fi
+note "KEY java_like_processes=${HINT_JAVA}"
+note "KEY deleted_fds=${HINT_DELETED}"
+note "KEY inode_mismatches=${HINT_MISMATCH}"
+note "KEY d_state_processes=${HINT_DSTATE}"
+
+section "11 nfs client counters"
+for f in /proc/self/mountstats /proc/fs/nfsfs/volumes /proc/fs/nfsfs/servers /proc/net/nfsfs/volumes /proc/net/nfsfs/servers /proc/net/rpc/nfs; do
+  if [[ -r "$f" ]]; then
+    echo "HAVE_FILE ${f}"
+  else
+    echo "NO_FILE ${f}"
+  fi
+done
+
+section "11b mountstats for LOGROOT"
+if [[ -r /proc/self/mountstats ]]; then
+  echo "-- device summary lines --"
+  while IFS= read -r line; do
+    case "$line" in
+      device\ *) printf '%s\n' "$line" ;;
+    esac
+  done < /proc/self/mountstats
+  echo "-- selected mount body --"
+  show=0
+  body=""
+  while IFS= read -r line; do
+    case "$line" in
+      device\ *)
+        show=0
+        case "$line" in
+          *" mounted on ${LOGROOT} "*) show=1 ;;
+        esac
+        ;;
+    esac
+    if [[ $show -eq 1 ]]; then
+      printf '%s\n' "$line"
+      body="${body}
+${line}"
+    fi
+  done < /proc/self/mountstats
+  if [[ -z "$body" ]]; then
+    echo "MOUNTSTATS_SECTION_NOT_FOUND for ${LOGROOT}"
+  fi
+  while IFS= read -r line; do
+    trim=$line
+    while [[ "$trim" == [[:space:]]* ]]; do
+      trim=${trim#?}
+    done
+    case "$trim" in
+      events:*)
+        split_nums "${trim#events:}"
+        label_numbers events "${EVENT_NAMES[@]}"
+        ;;
+      bytes:*)
+        split_nums "${trim#bytes:}"
+        label_numbers bytes "${BYTE_NAMES[@]}"
+        ;;
+      age:*)
+        echo "MOUNT_AGE_SECONDS ${trim#age:}"
+        ;;
+      "RPC iostats version:"*)
+        echo "IOSTATS_VERSION_LINE ${trim}"
+        ;;
+    esac
+    case "$trim" in
+      [A-Z0-9_]*:*)
+        label_op "$trim"
+        ;;
+    esac
+  done <<< "$body"
+else
+  echo "mountstats not visible in this namespace. fd and mount table evidence still stands."
+fi
+
+section "12 tcp port 2049"
+for f in /proc/net/tcp /proc/net/tcp6; do
+  if [[ -r "$f" ]]; then
+    tcp_ready=1
+  else
+    tcp_ready=0
+  fi
+  if [[ $tcp_ready -eq 0 ]]; then
+    echo "NO ${f}"
+    continue
+  fi
+  echo "-- ${f} lines whose port hex is 0801 (decimal 2049) --"
+  while read -r sl locala rema st _rest; do
+    case "$sl" in
+      sl) continue ;;
+    esac
+    lport=${locala#*:}
+    rport=${rema#*:}
+    if [[ "$lport" == "0801" || "$rport" == "0801" ]]; then
+      case "$f" in
+        *tcp6)
+          echo "TCP6_RAW local=${locala} remote=${rema} state=$(state_name "$st")"
+          ;;
+        *)
+          echo "TCP4 $(decode_ipv4 "$locala") -> $(decode_ipv4 "$rema") state=$(state_name "$st")"
+          ;;
+      esac
+    fi
+  done < "$f"
+done
+echo "A connection to 127.0.0.1:2049 is the usual shape of the Fargate or ECS EFS TLS proxy. ESTALE still originates on the EFS side and is forwarded through that proxy."
+
+section "13 optional helpers"
+if have java; then
+  run_cmd 20 java -version
+fi
+if have rpm; then
+  run_cmd 20 rpm -q util-linux bash coreutils findutils procps-ng nfs-utils lsof gawk
+fi
+if [[ -d /proc/1 ]]; then
+  for d in /proc/[0-9]*; do
+    exe=$(readlink "$d/exe" 2>/dev/null)
+    case "$exe" in
+      */java)
+        echo "java_binary_version_from ${exe}"
+        run_cmd 20 "$exe" -version
+        break
+        ;;
+    esac
+  done
+fi
+if have jcmd && [[ -d /proc/1 ]]; then
+  for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    comm=$(cat "$d/comm" 2>/dev/null)
+    case "$comm" in
+      java)
+        echo "jcmd ${pid} VM.version"
+        out=$(timeout 12 jcmd "$pid" VM.version 2>&1)
+        rc=$?
+        printf '%s\n' "$out"
+        echo "exit=${rc}"
+        echo "jcmd ${pid} VM.command_line (masked)"
+        out=$(timeout 12 jcmd "$pid" VM.command_line 2>&1)
+        rc=$?
+        mask_line "$out"
+        echo "exit=${rc}"
+        echo "NOTE: jcmd uses the JVM attach socket. Fargate does not grant SYS_PTRACE, so the ptrace fallback cannot run. Failure here does not weaken the /proc evidence."
+        ;;
+    esac
+  done
+fi
+if have nfsstat; then
+  run_cmd 15 nfsstat -m
+fi
+
+section "14 summary"
+printf '%s\n' "$KEY_LINES"
+echo "dir_listing_saw_estale=${HINT_DIR_ESTALE}"
+echo "any_estale_text=${HINT_SAW_ESTALE}"
+echo "deleted_fds=${HINT_DELETED}"
+echo "inode_mismatches=${HINT_MISMATCH}"
+echo "dotnfs_files=${HINT_DOTNFS}"
+echo "lck_files=${HINT_LCK}"
+echo "mount_is_nfs=${HINT_NFS}"
+echo "mount_is_other=${HINT_NOT_NFS}"
+echo "localhost_proxy=${HINT_PROXY}"
+echo "sillyrename_counter_nonzero=${HINT_SILLY}"
+echo "timeouts=${HINT_TIMEOUT}"
+echo "java_like_processes=${HINT_JAVA}"
+echo "d_state_processes=${HINT_DSTATE}"
+echo "exception_line_hits=${EXCEPTION_HITS}"
+
+echo "-- how to read the combination --"
+if [[ $HINT_NOT_NFS -eq 1 ]]; then
+  echo "READ: このパスを覆っているマウントは nfs でも nfs4 でもない。ESTALE は NFS 系のエラー番号なので、先に fstype を記録する。"
+fi
+if [[ $HINT_NFS -eq 1 ]]; then
+  echo "READ: ${LOGROOT} は NFS クライアント越しに見えている。Fargate の EFS ボリュームはこの形になる。"
+fi
+if [[ $HINT_PROXY -eq 1 ]]; then
+  echo "READ: サーバアドレスが 127.0.0.1 である。転送中の暗号化を行うローカルプロキシの形である。別のファイルシステムが紛れ込んだサインではない。"
+fi
+if [[ $HINT_DELETED -gt 0 || $HINT_MISMATCH -gt 0 ]]; then
+  echo "READ: プロセスが握っている記述子の inode が、同じ名前のパスと違うか、削除済みである。NFS 上のログローテーションで名前だけ作り直され、開いたままの記述子が古い整理券を持ち続けている形である。"
+fi
+if [[ $HINT_DOTNFS -gt 0 || $HINT_SILLY -eq 1 ]]; then
+  echo "READ: .nfs で始まる名前、または sillyrename カウンタが 0 より大きい。このクライアントは、開いたファイルを消す代わりに別名へ避けた。.nfs ファイルは消さない。"
+fi
+if [[ $HINT_SAW_ESTALE -eq 1 && $HINT_DELETED -eq 0 && $HINT_MISMATCH -eq 0 ]]; then
+  echo "READ: エラー文言はあるが、この実行では削除済み記述子も inode の食い違いも見つからなかった。open やディレクトリ読みの瞬間の失敗、すでに閉じたあと、または別コンテナのローテータが原因のことがある。Fargate の規定ではコンテナごとにプロセス番号空間が分かれる。"
+fi
+if [[ $HINT_DSTATE -gt 0 || $HINT_TIMEOUT -gt 0 ]]; then
+  echo "READ: プロセス状態 D、または制限時間切れは、応答のない RPC である。ESTALE 自体はすぐ戻る。両方が同じ障害の中で並ぶことはあり、仕組みは別である。"
+fi
+if [[ $EXCEPTION_HITS -eq 0 ]]; then
+  echo "READ: ${LOGROOT} の末尾からは該当行が見つからなかった。java.util.logging.ErrorManager は最初の書き込み失敗だけを標準エラーへ出し、以降は黙る。スタックトレースは書けなかったファイルではなく awslogs 側にあることが多い。"
+fi
+echo "DO_NOT: このコンテナから umount、mount -o remount、rm、kill、logrotate、truncate はしない。Fargate は CAP_SYS_ADMIN を渡さない。証拠を持ち出してから、復旧はタスクの再起動とログ出力の設計で行う。"
+echo "END_OF_PROBE"
+exit 0
+ESTALE_PROBE_END
+
+: <<'ESTALE_SKIP_INDIVIDUAL'
+# ここから ESTALE_SKIP_INDIVIDUAL の直前までは、ファイル全体を貼ったときにはデータとして読み飛ばされる。
+# 個別に使うときは、set +H の行から ESTALE_BLOCK_番号 の行までをコピーする。
+# 一括調査で足りるときは、この範囲を貼らなくてよい。
+
+# C01 ECS Exec で bash に入る
+# 危険度: 接続だけ。コンテナの中はまだ何もしない
+# 実行場所: 手元の端末
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C01'
+aws ecs execute-command --cluster CLUSTER_NAME --task TASK_ID --container CONTAINER_NAME --interactive --command "/bin/bash"
+ESTALE_BLOCK_C01
+
+# C02 set +H と子シェルで一括調査を流す
+# 危険度: 読み取り専用
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C02'
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_PROBE_END'
+echo "child bash=${BASH_VERSION} logroot=${LOGROOT}"
+echo "この3行は貼り方の確認用。本番はテキストファイル先頭の一括ブロックを使う。"
+ESTALE_PROBE_END
+ESTALE_BLOCK_C02
+
+# C03 表示言語を C に固定する
+# 危険度: 読み取り専用。このシェルの表示言語だけ変わる
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C03'
+export LC_ALL=C
+export LANG=C
+export LC_MESSAGES=C
+locale 2>/dev/null || true
+ESTALE_BLOCK_C03
+
+# C04 カレントディレクトリを / にする
+# 危険度: 読み取り専用
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C04'
+cd /
+pwd
+ESTALE_BLOCK_C04
+
+# C05 時刻、利用者、カーネルを記録する
+# 危険度: 読み取り専用
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C05'
+date +%Y-%m-%dT%H:%M:%S%z
+date -u +%Y-%m-%dT%H:%M:%SZ
+id
+uname -a
+echo "bash=${BASH_VERSION}"
+ESTALE_BLOCK_C05
+
+# C06 /etc/os-release で UBI 9.8 を確認する
+# 危険度: 読み取り専用
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C06'
+cat /etc/os-release
+cat /etc/redhat-release 2>/dev/null || true
+ESTALE_BLOCK_C06
+
+# C07 コマンドの在庫を確認する
+# 危険度: 読み取り専用
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C07'
+for c in bash ls stat df find findmnt ps awk grep sed timeout readlink ss lsof nfsstat jcmd java rpm tr sort head tail wc date id uname cat
+do
+  if command -v "$c" >/dev/null 2>&1
+  then
+    printf 'HAVE %s -> %s\n' "$c" "$(command -v "$c")"
+  else
+    printf 'MISSING %s\n' "$c"
+  fi
+done
+ESTALE_BLOCK_C07
+
+# C08 timeout で待ちに上限を付ける
+# 危険度: 読み取り専用。効かない待ちがある
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C08'
+timeout 15 ls -ld -- /mnt/logs
+echo "exit=$?"
+ESTALE_BLOCK_C08
+
+# C09 /proc/mounts と mountinfo で実体を見る
+# 危険度: 読み取り専用
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C09'
+echo "==== /proc/mounts ===="
+cat /proc/mounts
+echo "==== mountinfo ===="
+while IFS= read -r line
+do
+  case "$line" in
+    *" ${LOGROOT} "*) printf '%s
+' "$line" ;;
+  esac
+done < /proc/self/mountinfo
+ESTALE_BLOCK_C09
+
+# C10 findmnt で同じ事実を 1 行に揃える
+# 危険度: 読み取り専用。コマンドが無いことが多い
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C10'
+if command -v findmnt >/dev/null 2>&1
+then
+  timeout 15 findmnt -T "$LOGROOT" -o TARGET,SOURCE,FSTYPE,OPTIONS
+else
+  echo "MISSING findmnt. C09 の /proc/mounts を使う。"
+fi
+ESTALE_BLOCK_C10
+
+# C11 stat -f と df で場所の種類と空きを残す
+# 危険度: 読み取り専用。固まることがある
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C11'
+timeout 15 stat -f -c 'hex=%t name=%T bsize=%S blocks=%b avail=%a files=%c' -- "$LOGROOT"
+timeout 15 df -hT -- "$LOGROOT"
+timeout 15 df -i -- "$LOGROOT"
+ESTALE_BLOCK_C11
+
+# C12 ディレクトリ自身の inode と時刻を見る
+# 危険度: 読み取り専用
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C12'
+timeout 15 stat -c 'inode=%i device=%d links=%h mode=%A size=%s mtime=%y name=%n' -- "$LOGROOT"
+timeout 15 ls -ld --time-style=full-iso --color=never -- "$LOGROOT"
+ESTALE_BLOCK_C12
+
+# C13 直下の名前、サイズ、時刻を一覧する
+# 危険度: 読み取り専用。件数が多いと RPC が増える
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C13'
+timeout 20 ls -la --time-style=full-iso --color=never -- "$LOGROOT"
+ESTALE_BLOCK_C13
+
+# C14 深さを限って名前と inode を歩く
+# 危険度: 読み取り専用。metadata の負荷がある
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C14'
+if command -v find >/dev/null 2>&1
+then
+  timeout 25 find "$LOGROOT" -xdev -maxdepth 3 -printf '%T+ %s %y %i %p
+'
+else
+  echo "MISSING find. 一括調査の ENTRY 行が代わり。深さ 4、400 件で止まる。"
+fi
+ESTALE_BLOCK_C14
+
+# C15 .nfs と .lck と空ファイルを印にする
+# 危険度: 読み取り専用。ファイルは消さない
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C15'
+if command -v find >/dev/null 2>&1
+then
+  timeout 25 find "$LOGROOT" -xdev -maxdepth 5 \( -name '.nfs*' -o -name '*.lck' -o -size 0 \) -printf '%T+ %s %i %p\n'
+else
+  echo "MISSING find. 一括調査の DOTNFS と LOCKFILE と ZERO_BYTE を数える。"
+fi
+ESTALE_BLOCK_C15
+
+# C16 末尾だけ読み、三つの文言を探す
+# 危険度: 読み取り専用
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C16'
+FILE="${FILE:-$LOGROOT/app.log}"
+echo "FILE=${FILE}"
+timeout 15 tail -n 120 -- "$FILE" | while IFS= read -r line
+do
+  low=$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')
+  case "$low" in
+    *"stale file handle"*|*"stale nfs file handle"*) printf '%s
+' "$line" ;;
+  esac
+  case "$line" in
+    *"古いファイルハンドルです"*|*"実効性のないNFSファイルハンドルです"*|*"ErrorManager: 1"*) printf '%s
+' "$line" ;;
+  esac
+done
+ESTALE_BLOCK_C16
+
+# C17 /proc で状態と Java を見つける
+# 危険度: 読み取り専用
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C17'
+for d in /proc/[0-9]*
+do
+  pid=${d#/proc/}
+  comm=$(cat "$d/comm" 2>/dev/null || true)
+  state=""
+  if [[ -r "$d/status" ]]
+  then
+    while IFS= read -r sline
+    do
+      case "$sline" in
+        State:*) state=${sline#State:} ;;
+      esac
+    done < "$d/status"
+  fi
+  printf 'PID %s comm=%s state=%s
+' "$pid" "$comm" "$state"
+done
+ESTALE_BLOCK_C17
+
+# C18 cmdline はマスクし、環境変数は名前だけ見る
+# 危険度: 読み取り専用。値の漏えいに注意
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C18'
+pid="${PID:?PID を指定する}"
+echo "==== cmdline ===="
+tr '\0' ' ' < "/proc/${pid}/cmdline"
+echo
+echo "==== env names only ===="
+while IFS= read -r -d '' ev
+do
+  printf '%s\n' "${ev%%=*}"
+done < "/proc/${pid}/environ"
+ESTALE_BLOCK_C18
+
+# C19 fd のリンク先で /mnt/logs と deleted を拾う
+# 危険度: 読み取り専用。ソケットは読まない
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C19'
+pid="${PID:?PID を指定する}"
+for fdpath in /proc/${pid}/fd/*
+do
+  target=$(readlink "$fdpath" 2>/dev/null || true)
+  case "$target" in
+    "${LOGROOT}"|"${LOGROOT}"/*|*" (deleted)")
+      printf '%s -> %s\n' "${fdpath##*/}" "$target"
+      ;;
+  esac
+done
+ESTALE_BLOCK_C19
+
+# C20 fd とパスの inode を並べる
+# 危険度: 読み取り専用
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C20'
+pid="${PID:?PID を指定する}"
+fd="${FD:?FD を指定する}"
+TARGET="${TARGET:?パスを指定する}"
+echo "FD_STAT $(timeout 10 stat -c 'inode=%i device=%d size=%s links=%h type=%F' -- "/proc/${pid}/fd/${fd}" 2>&1)"
+echo "PATH_STAT $(timeout 10 stat -c 'inode=%i device=%d size=%s links=%h type=%F' -- "$TARGET" 2>&1)"
+ESTALE_BLOCK_C20
+
+# C21 fdinfo の位置と開いた旗を読む
+# 危険度: 読み取り専用
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C21'
+pid="${PID:?PID を指定する}"
+fd="${FD:?FD を指定する}"
+cat -- "/proc/${pid}/fdinfo/${fd}"
+ESTALE_BLOCK_C21
+
+# C22 普通のファイルの fd だけ末尾を読む
+# 危険度: 読み取り専用。ソケットは読まない
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C22'
+pid="${PID:?PID を指定する}"
+fd="${FD:?FD を指定する}"
+kind=$(timeout 10 stat -c '%F' -- "/proc/${pid}/fd/${fd}" 2>&1 || true)
+echo "kind=${kind}"
+case "$kind" in
+  regular*)
+    timeout 10 tail -n 20 -- "/proc/${pid}/fd/${fd}" | tr -d '\000'
+    ;;
+  *)
+    echo "SKIP regular file ではないので読まない"
+    ;;
+esac
+ESTALE_BLOCK_C22
+
+# C23 開いている本数と上限を比べる
+# 危険度: 読み取り専用
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C23'
+pid="${PID:?PID を指定する}"
+echo "fd_entries:"
+printf '%s\n' /proc/${pid}/fd/* | wc -l
+echo "==== limits ===="
+while IFS= read -r line
+do
+  case "$line" in
+    "Max open files"*) printf '%s\n' "$line" ;;
+  esac
+done < "/proc/${pid}/limits"
+ESTALE_BLOCK_C23
+
+# C24 mountstats から /mnt/logs の節を抜く
+# 危険度: 読み取り専用。ファイルが無い構成がある
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C24'
+show=0
+while IFS= read -r line
+do
+  case "$line" in
+    device\ *)
+      show=0
+      case "$line" in
+        *" mounted on ${LOGROOT} "*) show=1 ;;
+      esac
+      ;;
+  esac
+  if [[ "$show" == "1" ]]
+  then
+    printf '%s\n' "$line"
+  fi
+done < /proc/self/mountstats
+ESTALE_BLOCK_C24
+
+# C25 events の sillyrename を名前で読む
+# 危険度: 読み取り専用。並びはカーネルの版に従う
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C25'
+echo "events 行の 22 番目の数が sillyrename。0 始まりでは 21。"
+echo "一括調査は名前を付けて sillyrename= の行を出す。"
+while IFS= read -r line
+do
+  case "$line" in
+    *events:*) printf '%s\n' "$line" ;;
+  esac
+done < /proc/self/mountstats
+ESTALE_BLOCK_C25
+
+# C26 WRITE と REMOVE と RENAME の回数を見る
+# 危険度: 読み取り専用
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C26'
+echo "列は ops trans timeouts bytes_sent bytes_recv queue_ms rtt_ms execute_ms errors"
+echo "errors は 9 列目。RPC iostats 1.1 以降。再送の目安は trans から ops を引く。"
+while IFS= read -r line
+do
+  trim=$line
+  while [[ "$trim" == [[:space:]]* ]]
+  do
+    trim=${trim#?}
+  done
+  case "$trim" in
+    WRITE:*|READ:*|COMMIT:*|OPEN:*|CLOSE:*|CREATE:*|REMOVE:*|RENAME:*|SETATTR:*|GETATTR:*)
+      printf '%s\n' "$trim"
+      ;;
+  esac
+done < /proc/self/mountstats
+ESTALE_BLOCK_C26
+
+# C27 nfsfs と rpc/nfs の有無を残す
+# 危険度: 読み取り専用
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C27'
+for f in /proc/fs/nfsfs/volumes /proc/fs/nfsfs/servers /proc/net/nfsfs/volumes /proc/net/nfsfs/servers /proc/net/rpc/nfs
+do
+  echo "==== ${f}"
+  if [[ -r "$f" ]]
+  then
+    head -n 40 -- "$f"
+  else
+    echo "NO_FILE"
+  fi
+done
+ESTALE_BLOCK_C27
+
+# C28 TCP の 2049 番が 127.0.0.1 かを見る
+# 危険度: 読み取り専用
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C28'
+echo "2049 の 16 進は 0801。IPv4 の 0100007F:0801 は 127.0.0.1:2049。"
+echo "一括調査はこの解読を行い、TCP4 の行を出す。"
+if [[ -r /proc/net/tcp ]]
+then
+  head -n 20 -- /proc/net/tcp
+else
+  echo "NO /proc/net/tcp"
+fi
+ESTALE_BLOCK_C28
+
+# C29 java -version と、通るときだけ jcmd を使う
+# 危険度: 読み取り専用に近い。短い JVM 起動がありうる
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C29'
+if command -v java >/dev/null 2>&1
+then
+  timeout 20 java -version
+else
+  echo "java is not on PATH. 一括調査は /proc/PID/exe の実体でも -version を試す。"
+fi
+if command -v jcmd >/dev/null 2>&1 && [[ -n "${PID:-}" ]]
+then
+  timeout 12 jcmd "$PID" VM.version
+  timeout 12 jcmd "$PID" VM.command_line
+else
+  echo "jcmd をスキップ。PID が空か、jcmd が無い。/proc の cmdline で足りる。"
+fi
+ESTALE_BLOCK_C29
+
+# C30 末尾の KEY と READ を判定表へ当てはめる
+# 危険度: 読み取り専用。新しい事実は増えない
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C30'
+echo "一括調査の末尾、SUMMARY から END_OF_PROBE までをコピーする。"
+echo "KEY の行は機械が数えた事実。READ の行は、その組み合わせの読み方。"
+echo "06_判定の表へ、観測を 1 行ずつ当てはめる。"
+ESTALE_BLOCK_C30
+
+# C31 復旧コマンドは表示もしない
+# 危険度: 実行しない。説明だけ
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C31'
+echo "このブロックは何も変更しない。"
+echo "umount、mount のやり直し、rm、mv、truncate、logrotate、kill、strace は実行しない。"
+echo "理由は詳解の「この場でやらないこと」を読む。"
+ESTALE_BLOCK_C31
+
+# C32 許可があるときだけ 1 行を書いて消す
+# 危険度: 書き込みあり。一括調査には入っていない
+# 実行場所: コンテナの bash
+set +H
+LOGROOT="${LOGROOT:-/mnt/logs}" bash <<'ESTALE_BLOCK_C32'
+echo "許可が無いなら、ここで Ctrl ではなく、このブロックを貼らない。"
+echo "貼った場合だけ、自分の調査ファイルを 1 つ作り、確認して、そのファイルだけ消す。"
+f="${LOGROOT}/.estale_probe_$$"
+printf '%s\n' probe > "$f"
+timeout 10 stat -c 'inode=%i size=%s name=%n' -- "$f"
+rm -f -- "$f"
+echo "removed ${f}"
+ESTALE_BLOCK_C32
+ESTALE_SKIP_INDIVIDUAL
